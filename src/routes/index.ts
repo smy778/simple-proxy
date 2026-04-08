@@ -30,6 +30,12 @@ function normalizeForcedHeaders(input: unknown) {
     ) as Record<string, string>;
 }
 
+function getProxyResponseType(
+    headers: Record<string, string | string[] | undefined>,
+) {
+    return toHeaderValue(headers['x-proxy-response-type'])?.trim().toLowerCase();
+}
+
 function getForcedHeadersFromIncoming(
     headers: Record<string, string | string[] | undefined>,
 ) {
@@ -40,6 +46,7 @@ function getForcedHeadersFromIncoming(
         const value = toHeaderValue(rawValue);
 
         if (!key.startsWith('x-')) continue;
+        if (key.startsWith('x-proxy-')) continue;
         if (value == null) continue;
 
         out[key.slice(2)] = value;
@@ -94,6 +101,7 @@ export default defineEventHandler(async (event) => {
     const method = (event.node.req.method || 'GET').toUpperCase();
     const body = await getBodyBuffer(event);
     const token = await createTokenIfNeeded(event);
+    const proxyResponseType = getProxyResponseType(event.node.req.headers);
 
     let queryForcedHeaders: Record<string, string> = {};
     if (query.headers) {
@@ -148,6 +156,40 @@ export default defineEventHandler(async (event) => {
     }
 
     try {
+        if (proxyResponseType === 'text' || proxyResponseType === 'plaintext') {
+            const response = await fetch(destination, fetchOptions);
+            const text = await response.text();
+
+            handleCors(event, {});
+            event.node.res.statusCode = response.status;
+
+            const headers = getAfterResponseHeaders(
+                response.headers,
+                response.url,
+            ) as Record<string, string>;
+
+            const filteredHeaders = Object.fromEntries(
+                Object.entries(headers).filter(([key]) => {
+                    const lower = key.toLowerCase();
+                    return (
+                        lower !== 'content-type' &&
+                        lower !== 'content-length' &&
+                        lower !== 'content-encoding' &&
+                        lower !== 'transfer-encoding'
+                    );
+                }),
+            );
+
+            setResponseHeaders(event, filteredHeaders);
+            event.node.res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            event.node.res.setHeader('X-Content-Type-Options', 'nosniff');
+
+            if (token) setTokenHeader(event, token);
+
+            event.node.res.end(text);
+            return;
+        }
+
         await specificProxyRequest(event, destination, {
             blacklistedHeaders: getBlacklistedHeaders(),
             fetchOptions,
